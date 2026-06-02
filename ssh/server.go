@@ -59,6 +59,32 @@ type GSSAPIWithMICConfig struct {
 	Server GSSAPIServer
 }
 
+// noTouchRequiredExtension is the extension name used by OpenSSH in
+// authorized_keys options and certificate extensions to mark keys
+// whose signatures do not need to assert user presence (touch). See
+// ssh-keygen(1) and sshd(8).
+const noTouchRequiredExtension = "no-touch-required"
+
+// noTouchAllowed reports whether the user presence requirement on
+// SK signatures should be waived for this authentication attempt. The
+// requirement is waived when the "no-touch-required" extension is
+// present either in the Permissions returned by the auth callback
+// (authorized_keys-level opt-out) or in the certificate's own
+// Extensions (CA-level opt-out), matching OpenSSH behavior.
+func noTouchAllowed(pubKey PublicKey, perms *Permissions) bool {
+	if perms != nil {
+		if _, ok := perms.Extensions[noTouchRequiredExtension]; ok {
+			return true
+		}
+	}
+	if cert, ok := pubKey.(*Certificate); ok {
+		if _, ok := cert.Extensions[noTouchRequiredExtension]; ok {
+			return true
+		}
+	}
+	return false
+}
+
 // ServerConfig holds server specific configuration data.
 type ServerConfig struct {
 	// Config contains configuration shared between client and server.
@@ -149,7 +175,7 @@ func (s *ServerConfig) AddHostKey(key Signer) {
 }
 
 // cachedPubKey contains the results of querying whether a public key is
-// acceptable for a user.
+// acceptable for a user. This is a FIFO cache.
 type cachedPubKey struct {
 	user       string
 	pubKeyData []byte
@@ -157,7 +183,13 @@ type cachedPubKey struct {
 	perms      *Permissions
 }
 
-const maxCachedPubKeys = 16
+// maxCachedPubKeys is the number of cache entries we store.
+//
+// Due to consistent misuse of the PublicKeyCallback API, we have reduced this
+// to 1, such that the only key in the cache is the most recently seen one. This
+// forces the behavior that the last call to PublicKeyCallback will always be
+// with the key that is used for authentication.
+const maxCachedPubKeys = 1
 
 // pubKeyCache caches tests for public keys.  Since SSH clients
 // will query whether a public key is acceptable before attempting to
@@ -179,9 +211,10 @@ func (c *pubKeyCache) get(user string, pubKeyData []byte) (cachedPubKey, bool) {
 
 // add adds the given tuple to the cache.
 func (c *pubKeyCache) add(candidate cachedPubKey) {
-	if len(c.keys) < maxCachedPubKeys {
-		c.keys = append(c.keys, candidate)
+	if len(c.keys) >= maxCachedPubKeys {
+		c.keys = c.keys[1:]
 	}
+	c.keys = append(c.keys, candidate)
 }
 
 // ServerConn is an authenticated SSH connection, as seen from the
@@ -189,8 +222,10 @@ func (c *pubKeyCache) add(candidate cachedPubKey) {
 type ServerConn struct {
 	Conn
 
-	// If the succeeding authentication callback returned a
-	// non-nil Permissions pointer, it is stored here.
+	// If the succeeding authentication callback returned a non-nil Permissions
+	// pointer, it is stored here. These are the permissions from the final,
+	// successful authentication method. Permissions returned by callbacks that
+	// return PartialSuccessError are not preserved and must be nil.
 	Permissions *Permissions
 }
 
@@ -688,7 +723,14 @@ userAuthLoop:
 
 				signedData := buildDataSignedForAuth(sessionID, userAuthReq, algo, pubKeyData)
 
-				if err := pubKey.Verify(signedData, sig); err != nil {
+				// Derive a separate value for Verify that carries any
+				// applicable no-touch-required opt-out, leaving the
+				// client-presented pubKey untouched.
+				pubKeyForVerify := pubKey
+				if noTouchAllowed(pubKey, candidate.perms) {
+					pubKeyForVerify = skKeyWithoutUP(pubKey)
+				}
+				if err := pubKeyForVerify.Verify(signedData, sig); err != nil {
 					return nil, err
 				}
 
@@ -771,6 +813,13 @@ userAuthLoop:
 		var failureMsg userAuthFailureMsg
 
 		if partialSuccess, ok := authErr.(*PartialSuccessError); ok {
+			// Permissions are not preserved between authentication steps. To
+			// avoid confusion about the final state of the connection, we
+			// disallow returning non-nil Permissions combined with
+			// PartialSuccessError.
+			if perms != nil {
+				return nil, errors.New("ssh: permissions must be nil when returning PartialSuccessError")
+			}
 			// After a partial success error we don't allow changing the user
 			// name and execute the NoClientAuthCallback.
 			partialSuccessReturned = true
